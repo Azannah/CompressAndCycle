@@ -22,8 +22,67 @@ New-Module -ScriptBlock {
     "Parent+Group" = { ((Split-Path $_.FullName -Parent).Split("\")[-1] + "_" + $_.GroupTag) -replace "[<>:`"/\|?*]", "_" };
   }
 
-  $common_task_dynamic_parameters = @(
-    @{}
+  $common_task_parameters = @(
+    @{
+      Name = "Path";
+      Type = ([string]);
+      Mandatory = $true;
+      Position = 0;
+      ValueFromPipeline = $false;
+      ValueFromPipelineByPropertyName = $true;
+      HelpMessage = "The base path containing items to be processed";
+    },
+    @{
+      Name = "ItemGroupingMethod";
+      Type = ([string]);
+      Mandatory = $true;
+      Position = 5;
+      ValueFromPipeline = $false;
+      ValueFromPipelineByPropertyName = $true;
+      HelpMessage = "Define how items will be grouped (by 'Day' for example)";
+      ValidateSet = $grouping_functions.Keys;
+    },
+    @{
+      Name = "Include";
+      Type = ([regex]);
+      Mandatory = $false;
+      Position = 10;
+      ValueFromPipeline = $false;
+      ValueFromPipelineByPropertyName = $true;
+      Default = [regex]'.*'; # Default, include everything
+    },
+    @{
+      Name = "Exclude";
+      Type = ([regex]);
+      Mandatory = $false;
+      Position = 15;
+      ValueFromPipeline = $false;
+      ValueFromPipelineByPropertyName = $true;
+      Default = [regex]'(?!)'; #Default, exclude nothing
+    },
+    @{
+      Name = "UnactionableTimespan";
+      Type = ([timespan]);
+      Mandatory = $false;
+      Position = 20;
+      ValueFromPipeline = $false;
+      ValueFromPipelineByPropertyName = $true;
+      Default = New-Object System.TimeSpan(0,0,0,0);
+    },
+    @{
+      Name = "Recurse";
+      Type = ([switch]);
+      ValueFromPipeline = $false;
+      ValueFromPipelineByPropertyName = $true;
+      Default = [switch]$false;
+    },
+    @{
+      Name = "WhatIf";
+      Type = ([switch]);
+      ValueFromPipeline = $false;
+      ValueFromPipelineByPropertyName = $true;
+      Default = [switch]$false;
+    }
   )
 
   <#
@@ -214,6 +273,9 @@ New-Module -ScriptBlock {
 		  [string[]]$ValidateSet,
 
 		  [Parameter(ValueFromPipelineByPropertyName = $true, ParameterSetName = 'DynamicParameter')]
+		  [object]$Default = $null,
+
+		  [Parameter(ValueFromPipelineByPropertyName = $true, ParameterSetName = 'DynamicParameter')]
 		  [ValidateNotNullOrEmpty()]
 		  [ValidateScript({
 			  if(!($_ -is [System.Management.Automation.RuntimeDefinedParameterDictionary]))
@@ -291,7 +353,7 @@ New-Module -ScriptBlock {
 						  }
 			  if($StaleKeys)
 			  {
-				  "Found $($StaleKeys.Count) cached bound parameters:",  $StaleKeys | Write-Debug
+				  "Found $($StaleKeys.Count) cached bound parameters:",  $StaleKeys | Out-String | Write-Debug
 				  Write-Verbose 'Removing cached bound parameters'
 				  $StaleKeys | ForEach-Object {[void]$PSBoundParameters.Remove($_)}
 			  }
@@ -413,6 +475,19 @@ New-Module -ScriptBlock {
 
 				  Write-Debug 'Finishing creation of the new dynamic parameter'
 				  $Parameter = New-Object -TypeName System.Management.Automation.RuntimeDefinedParameter -ArgumentList @($Name, $Type, $AttributeCollection)
+          
+          Write-Debug 'Adding default value'
+          if ($Default -ne $null)
+          {
+            if ($Default -is $Type)
+            {
+              $Parameter.Value = $Default
+            }
+            else
+            {
+              Throw "The default value supplied for the $Name parameter is of type $($Default.GetType()), but $Name has been specified as type $Type"
+            }
+          }
 
 				  Write-Debug 'Adding dynamic parameter to the dynamic parameter dictionary'
 				  $DPDictionary.Add($Name, $Parameter)
@@ -436,223 +511,83 @@ New-Module -ScriptBlock {
   
     Param(
       [Parameter(
-        Mandatory = $true,
-        Position = 0
+        ValueFromPipeline=$false,
+        ValueFromPipelineByPropertyName=$true
       )]
-      [string]$Path,
-
-      [Parameter(
-        Position = 2
-      )]
-      [timespan]$UnactionableTimespan,
-
-      [Parameter(
-        Position = 1
-      )]
-      [regex]$Include = '*', # Default = Everything
-
-      [Parameter(
-        Position = 2
-      )]
-      [regex]$Exclude = '(?!)', # Default = Nothing
-
-      [Parameter(ParameterSetName="Archive")]
-      [switch]$RetainProcessedItems = $false,
-
-      [switch]$Recurse = $false,
-
-      [switch]$WhatIf = $false
+      [switch]$RetainProcessedItems = $false
     )
 
     DynamicParam {
 
       ### =====================================================================================
       ### ADD DYNAMIC PARAMETERS
-      ###
-      ### These exist for the sole purpose of allowing easy customization of the 
-      ### $grouping_functions and $naming_functions.
       ### =====================================================================================
-      ## Create the parameter dictionary
-      $parameter_dictionary = New-Object System.Management.Automation.RuntimeDefinedParameterDictionary
+      $function_parameters = $common_task_parameters + @(
+        @{
+          Name = "ArchiveNamingMethod";
+          Type = ([string]);
+          Mandatory = $true;
+          Position = 7;
+          ValueFromPipeline = $false;
+          ValueFromPipelineByPropertyName = $true;
+          HelpMessage = "The base path containing items to be processed";
+          ValidateSet = $naming_functions.Keys;
+        }
+      )
 
-      ## Create the ItemGroupingMethod dynamic parameter
-      $ItemGroupingMethod_name = "ItemGroupingMethod"
-    
-      # Create an attribute collection for ItemGroupingMethod
-      $ItemGroupingMethod_attribute_collection = New-Object System.Collections.ObjectModel.Collection[System.Attribute]
+      $function_parameters | % { New-Object psobject -Property $_ } | New-DynamicParameter
 
-      # [Parameter(...)]
-      $ItemGroupingMethod_attribute = New-Object System.Management.Automation.ParameterAttribute
-      $ItemGroupingMethod_attribute.Mandatory = $true
-      $ItemGroupingMethod_attribute_collection.Add($ItemGroupingMethod_attribute)
-
-      # [ValidateSet(...)]
-      $ItemGroupingMethod_attribute_validate_set = New-Object System.Management.Automation.ValidateSetAttribute($grouping_functions.Keys)
-      $ItemGroupingMethod_attribute_collection.Add($ItemGroupingMethod_attribute_validate_set)
-
-      # Create the ItemGroupingMethod runtime object
-      $ItemGroupingMethod_runtime = New-Object System.Management.Automation.RuntimeDefinedParameter($ItemGroupingMethod_name, [string], $ItemGroupingMethod_attribute_collection)
-
-      # Finalize by adding all dynamic parameter runtimes to the $parameter_dictionary
-      $parameter_dictionary.Add($ItemGroupingMethod_name, $ItemGroupingMethod_runtime)
-
-      ## Create the ArchiveNamingMethod dynamic parameter
-      $ArchiveNamingMethod_name = "ArchiveNamingMethod"
-    
-      # Create an attribute collection for ItemGroupingMethod
-      $ArchiveNamingMethod_attribute_collection = New-Object System.Collections.ObjectModel.Collection[System.Attribute]
-
-      # [Parameter(...)]
-      $ArchiveNamingMethod_attribute = New-Object System.Management.Automation.ParameterAttribute
-      $ArchiveNamingMethod_attribute.ParameterSetName = "Archive"
-      $ArchiveNamingMethod_attribute.Mandatory = $true
-      $ArchiveNamingMethod_attribute_collection.Add($ArchiveNamingMethod_attribute)
-
-      # [ValidateSet(...)]
-      $ArchiveNamingMethod_attribute_validate_set = New-Object System.Management.Automation.ValidateSetAttribute($naming_functions.Keys)
-      $ArchiveNamingMethod_attribute_collection.Add($ArchiveNamingMethod_attribute_validate_set)
-
-      # Create the ItemGroupingMethod runtime object
-      $ArchiveNamingMethod_runtime = New-Object System.Management.Automation.RuntimeDefinedParameter($ArchiveNamingMethod_name, [string], $ArchiveNamingMethod_attribute_collection)
-
-      # Finalize by adding all dynamic parameter runtimes to the $parameter_dictionary
-      $parameter_dictionary.Add($ArchiveNamingMethod_name, $ArchiveNamingMethod_runtime)
-    
-      return $parameter_dictionary
     }
 
     Begin {
-      $ItemGroupingMethod = $PsBoundParameters[$ItemGroupingMethod_name]
-      $ArchiveNamingMethod = $PsBoundParameters[$ArchiveNamingMethod_name]
+      # Create friendly variables for dynamic parameters
+      $function_parameters | % {
+        Set-Variable -Name $_.Name -Value $PsBoundParameters[$_.Name]
+      }
     }
+
     Process {}
     End { Write-Host $ItemGroupingMethod; Write-Host $ArchiveNamingMethod}
   }
 
   function New-CycleTask {
   
-    [CmdletBinding(DefaultParameterSetName="Archive")]
+    [CmdletBinding()]
   
     Param(
       [Parameter(
-        Mandatory = $true,
-        Position = 0
+        Position=7,
+        ValueFromPipeline=$false,
+        ValueFromPipelineByPropertyName=$true
       )]
-      [string]$Path,
-
-      [Parameter(
-        Mandatory = $true,
-        Position = 1
-      )]
-      [ValidateSet("Archive","Cycle")]
-      [string]$Action,
-
-      [Parameter(
-        Position = 2
-      )]
-      [timespan]$UnactionableTimespan,
-
-      [Parameter(ParameterSetName="Cycle")]
-      [int]$MaximumFileVersions = -1,
-
-      [Parameter(
-        Position = 1
-      )]
-      [regex]$Include = '*', # Default = Everything
-
-      [Parameter(
-        Position = 2
-      )]
-      [regex]$Exclude = '(?!)', # Default = Nothing
-
-      [Parameter(ParameterSetName="Archive")]
-      [switch]$RetainArchivedItems = $false,
-
-      [switch]$Recurse = $false,
-
-      [switch]$WhatIf = $false
+      [int]$MaximumFileVersions = -1
     )
 
     DynamicParam {
 
-      $grouping_functions = @{
-        None = { $_.Name };
-        Day = { $_.CreationTime.DayofYear };
-        SQLFulls = { if ($_.Extension -like ".bak") { $_.Name } else { $null } };
-      }
-
-      $naming_functions = @{
-        "FirstItem" = { begin { $first = $true } process{ if ($first) { $first = $false; $_.Name } else { $null } } }
-        "LastItem" = { $_.Name }
-        #"Parent+DateToMinute" = { (Split-Path $_.FullName -Parent).Split("\")[-1] + "_" + (Get-Date -Format "yyyy.MM.dd HHmm00"); break };
-        #"Parent+DateToHour" = { (Split-Path $_.FullName -Parent).Split("\")[-1] + "_" + (Get-Date -Format "yyyy.MM.dd HH0000"); break };
-        #"Parent+DateToDay" = { (Split-Path $_.FullName -Parent).Split("\")[-1] + "_" + (Get-Date -Format "yyyy.MM.dd"); break };
-        "Parent+Group" = { ((Split-Path $_.FullName -Parent).Split("\")[-1] + "_" + $_.GroupTag) -replace "[<>:`"/\|?*]", "_" };
-      }
-
       ### =====================================================================================
       ### ADD DYNAMIC PARAMETERS
-      ###
-      ### These exist for the sole purpose of allowing easy customization of the 
-      ### $grouping_functions and $naming_functions.
       ### =====================================================================================
-      ## Create the parameter dictionary
-      $parameter_dictionary = New-Object System.Management.Automation.RuntimeDefinedParameterDictionary
+      $function_parameters = $common_task_parameters
 
-      ## Create the ItemGroupingMethod dynamic parameter
-      $ItemGroupingMethod_name = "ItemGroupingMethod"
-    
-      # Create an attribute collection for ItemGroupingMethod
-      $ItemGroupingMethod_attribute_collection = New-Object System.Collections.ObjectModel.Collection[System.Attribute]
+      $function_parameters | % { New-Object psobject -Property $_ } | New-DynamicParameter
 
-      # [Parameter(...)]
-      $ItemGroupingMethod_attribute = New-Object System.Management.Automation.ParameterAttribute
-      $ItemGroupingMethod_attribute.Mandatory = $true
-      $ItemGroupingMethod_attribute_collection.Add($ItemGroupingMethod_attribute)
-
-      # [ValidateSet(...)]
-      $ItemGroupingMethod_attribute_validate_set = New-Object System.Management.Automation.ValidateSetAttribute($grouping_functions.Keys)
-      $ItemGroupingMethod_attribute_collection.Add($ItemGroupingMethod_attribute_validate_set)
-
-      # Create the ItemGroupingMethod runtime object
-      $ItemGroupingMethod_runtime = New-Object System.Management.Automation.RuntimeDefinedParameter($ItemGroupingMethod_name, [string], $ItemGroupingMethod_attribute_collection)
-
-      # Finalize by adding all dynamic parameter runtimes to the $parameter_dictionary
-      $parameter_dictionary.Add($ItemGroupingMethod_name, $ItemGroupingMethod_runtime)
-
-      ## Create the ArchiveNamingMethod dynamic parameter
-      $ArchiveNamingMethod_name = "ArchiveNamingMethod"
-    
-      # Create an attribute collection for ItemGroupingMethod
-      $ArchiveNamingMethod_attribute_collection = New-Object System.Collections.ObjectModel.Collection[System.Attribute]
-
-      # [Parameter(...)]
-      $ArchiveNamingMethod_attribute = New-Object System.Management.Automation.ParameterAttribute
-      $ArchiveNamingMethod_attribute.ParameterSetName = "Archive"
-      $ArchiveNamingMethod_attribute.Mandatory = $true
-      $ArchiveNamingMethod_attribute_collection.Add($ArchiveNamingMethod_attribute)
-
-      # [ValidateSet(...)]
-      $ArchiveNamingMethod_attribute_validate_set = New-Object System.Management.Automation.ValidateSetAttribute($naming_functions.Keys)
-      $ArchiveNamingMethod_attribute_collection.Add($ArchiveNamingMethod_attribute_validate_set)
-
-      # Create the ItemGroupingMethod runtime object
-      $ArchiveNamingMethod_runtime = New-Object System.Management.Automation.RuntimeDefinedParameter($ArchiveNamingMethod_name, [string], $ArchiveNamingMethod_attribute_collection)
-
-      # Finalize by adding all dynamic parameter runtimes to the $parameter_dictionary
-      $parameter_dictionary.Add($ArchiveNamingMethod_name, $ArchiveNamingMethod_runtime)
-    
-      return $parameter_dictionary
     }
 
     Begin {
-      $ItemGroupingMethod = $PsBoundParameters[$ItemGroupingMethod_name]
-      $ArchiveNamingMethod = $PsBoundParameters[$ArchiveNamingMethod_name]
+      # Create friendly variables for dynamic parameters
+      $function_parameters | % {
+        Set-Variable -Name $_.Name -Value $PsBoundParameters[$_.Name]
+      }
     }
     Process {}
     End { Write-Host $ItemGroupingMethod; Write-Host $ArchiveNamingMethod}
   }
-}
+
+  Export-ModuleMember -Function @(
+    "New-ArchiveTask"
+  )
+} | Out-Null
 
 ### =====================================================================================
 ### USER CONFIGURATION SECTION
@@ -667,6 +602,25 @@ New-Module -ScriptBlock {
 ###   what_if= <$true|$false>; #Run in "WhatIf" mode for testing (see output in log file)
 ### }
 ### =====================================================================================
+New-ArchiveTask -Path "D:\Temp\CnC Tests" `
+                -ItemGroupingMethod SQLFulls `
+                -ArchiveNamingMethod "Parent+Group" `
+                -Include '\.(bak|trn|dif)$' `
+                -Exclude '\.(zip|7z)$' `
+                -UnactionableTimeSpan (New-Object System.TimeSpan(1,0,0,0)) `
+                -Recurse `
+                -WhatIF
+
+New-CycleTask   -Path "D:\Temp\CnC Tests" `
+                -ItemGroupingMethod None `
+                -MaximumFileVersions 1 `
+                -Include '\.(zip|7z)$' `
+                -UnactionableTimeSpan (New-Object System.TimeSpan(30,0,0,0)) `
+                -Recurse `
+                -WhatIF
+
+break
+
 $workLoad = @{
 	path = "D:\Temp\CnC Tests";
 	recurse = $true;
