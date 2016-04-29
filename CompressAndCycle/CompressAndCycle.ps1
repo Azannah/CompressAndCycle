@@ -85,6 +85,104 @@ New-Module -ScriptBlock {
     }
   )
 
+  function script:group_items {
+    Param(
+      [object[]]$items,
+      [scriptblock[]]$grouping_functions,
+      [int]$starting_index = 0
+    )
+
+    #$groups = Group-Object -InputObject $items -Property $grouping_functions[$starting_index] -AsHashTable
+    $groups = @{}
+
+    $group_name = "Orphan"
+
+    $items | % {
+      $temp_group_name
+    }
+
+    if (($starting_index + 1) -lt $grouping_functions.Count) {
+      $groups.Keys | % { $groups[$_] = script:group_items -items $groups[$_] -grouping_functions $grouping_functions -starting_index ($starting_index + 1) }
+    }
+
+    return $groups
+  }
+
+  function script:item_matches_filters {
+    Param(
+      [Parameter(ValueFromPipeline = $true)]
+      [object]$item,
+      
+      [scriptblock[]]$filters,
+      
+      [ValidateSet('And','Or')]
+      [string]$operator
+    )
+
+    process {
+      switch ($operator) {
+        'And' {
+          $result = $item
+          $continue_check = { $result -ne $null }
+          break
+        }
+
+        'Or' {
+          $result = $null
+          $continue_check = { $result -eq $null }
+        }
+      }
+
+      $filters | ? $continue_check | % {
+        $result = Where-Object -InputObject $item -FilterScript $_
+      }
+
+      if ($result -ne $null) {
+        return $true
+      }
+
+      return $false
+    }
+
+  }
+
+  function script:get_filtered_groups {
+    Param(
+      [Parameter(ValueFromPipeline = $true)]
+      [string]$base_path,
+
+      [scriptblock[]]$include_filter,
+
+      [scriptblock[]]$exclude_filter,
+
+      [scriptblock[]]$grouping_function,
+
+      [switch]$recurse
+    )
+
+    Begin {
+    }
+
+    Process {
+      if (-not (Test-Path $base_path -PathType Container)) {
+        Throw "Path must specify a container"
+      }
+      
+      ## Filter and sort a list of items
+      $filtered_sorted_items = Get-ChildItem -Path $base_path -File -Recurse:$recurse | ? {
+        script:item_matches_filters -item $_ -filters $include_filter -operator And
+      } | ? { 
+        -not (script:item_matches_filters -item $_ -filters $exclude_filter -operator And)
+      } | Sort-Object -Property CreationTime
+
+      ## Group the items
+      $groups = script:group_items -items $filtered_sorted_items -grouping_functions $grouping_function
+
+      return $groups
+    }
+
+  }
+
   <#
   .SYNOPSIS
 	  Helper function to simplify creating dynamic parameters
@@ -546,7 +644,17 @@ New-Module -ScriptBlock {
       }
     }
 
-    Process {}
+    Process {
+      $item_groups = script:get_filtered_groups `
+        -base_path $Path `
+        -include_filter { $_.FullName -match $Include } `
+        -exclude_filter { $_.FullName -match $Exclude } `
+        -grouping_function @({$_.DirectoryName}, $grouping_functions[$ItemGroupingMethod]) `
+        -recurse:$Recurse
+
+      $item_groups | Out-String | Write-Host
+    }
+
     End { Write-Host $ItemGroupingMethod; Write-Host $ArchiveNamingMethod}
   }
 
