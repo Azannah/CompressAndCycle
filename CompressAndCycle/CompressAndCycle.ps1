@@ -7,19 +7,90 @@ $Error.clear()
 
 New-Module -ScriptBlock {
 
+  ### =====================================================================================
+  ### IMPORT REQUIRED MODULES
+  ### =====================================================================================
+  $required_modules = @(
+    "C:\Users\matthew.johnson\Source\Repos\7-Zip-PSM\7-Zip PSM\7-Zip.psm1"
+  )
+
+  $module_search_paths = @(
+    $PSScriptRoot,
+    (Get-Item ($PSScriptRoot + "\..\..\7-Zip-PSM\7-Zip PSM")).FullName
+  )
+
+  $Env:PSModulePath = ($module_search_paths -join ";") + ";" + $Env:PSModulePath
+
+  $required_modules | % {
+    try {
+      Import-Module "$_" -ErrorAction Stop
+    } catch {
+      throw [System.IO.FileNotFoundException] "Unable to locate the required module, $_"
+    }
+  }
+
+  ### =====================================================================================
+  ### CONFIGURE COMMON MODULE COMPONENTS
+  ### =====================================================================================
+
+  ## GROUPING FUNCTIONS
+
+  ## Note: the items are passed to the grouping functions individually (they are not processed
+  ## as part of a collection).
+
+  ## A GroupingState property is added to the object $_ with the following hashtable keys:
+  ##  items := a reference to the full items array being processed
+  ##  current_index := the index of the current item in the set being processed
+  ##  last_index := the index of the last item in the set being processed
+  ##  is_first_item := is true if the current_index == 0
+  ##  is_last_item := is true if the current_index == last_index
+  ##  default_tag := the default name to be used if no other value can be derieved.
+  ##    Note: This value is not used automatically - it's for reference purposes and must be 
+  ##    explicitly utilized
+  ##  last_tag := the last value that was sent on down the pipe - initially the default_tag
+  ##  tag := defaults to null, provide a string value to specify the group this item should
+  ##    belong to. Null values will result in the item being dropped (not grouped).
+
   $grouping_functions = @{
-    None = { $_.Name };
-    Day = { $_.CreationTime.DayofYear };
-    SQLFulls = { if ($_.Extension -like ".bak") { $_.Name } else { $null } };
+    None = { $_.GroupingState.tag = $_.Name; $_ };
+    ByDay = { $_.GroupingState.tag = [Convert]::ToString($_.CreationTime.DayofYear) + [Convert]::ToString($_.CreationTime.DayofYear); $_ };
+    BySQLFulls = { if ($_.Extension -like ".bak") { $_.GroupingState.tag = $_.Name } else { $_.GroupingState.tag = $_.GroupingState.last_tag } $_ };
   }
 
   $naming_functions = @{
-    "FirstItem" = { begin { $first = $true } process{ if ($first) { $first = $false; $_.Name } else { $null } } }
-    "LastItem" = { $_.Name }
-    #"Parent+DateToMinute" = { (Split-Path $_.FullName -Parent).Split("\")[-1] + "_" + (Get-Date -Format "yyyy.MM.dd HHmm00"); break };
-    #"Parent+DateToHour" = { (Split-Path $_.FullName -Parent).Split("\")[-1] + "_" + (Get-Date -Format "yyyy.MM.dd HH0000"); break };
-    #"Parent+DateToDay" = { (Split-Path $_.FullName -Parent).Split("\")[-1] + "_" + (Get-Date -Format "yyyy.MM.dd"); break };
-    "Parent+Group" = { ((Split-Path $_.FullName -Parent).Split("\")[-1] + "_" + $_.GroupTag) -replace "[<>:`"/\|?*]", "_" };
+    "FirstItemInGroup" = { if ($_.GroupingState.is_first_item) { $_.GroupingState.tag = $_.Name } else { $_.GroupingState.tag = $_.GroupingState.last_tag } $_ };
+
+    "LastItemInGroup" = { $_.GroupingState.tag = $_.GroupingState.items[$_.GroupingState.last_index].Name; $_ };
+
+    "Parent+CreatedDateByMinute" = {
+      $_.GroupingState.tag = (Split-Path $_.FullName -Parent).Split("\")[-1] + " " + $_.CreationTime.ToString("yyyy.MM.dd HHmm00")
+      $_
+    };
+
+    "Parent+CreatedDateByHour" = { 
+      $_.GroupingState.tag = (Split-Path $_.FullName -Parent).Split("\")[-1] + " " + $_.CreationTime.ToString("yyyy.MM.dd HH0000")
+      $_
+    };
+
+    "Parent+CreatedDateByDay" = {
+      $_.GroupingState.tag = (Split-Path $_.FullName -Parent).Split("\")[-1] + " " + $_.CreationTime.ToString("yyyy.MM.dd")
+      $_
+    };
+
+    "Parent+ModifiedDateByMinute" = { 
+      $_.GroupingState.tag = (Split-Path $_.FullName -Parent).Split("\")[-1] + " " + $_.LastWriteTime.ToString("yyyy.MM.dd HHmm00")
+      $_
+    };
+
+    "Parent+ModifiedDateByHour" = {
+      $_.GroupingState.tag = (Split-Path $_.FullName -Parent).Split("\")[-1] + " " + $_.LastWriteTime.ToString("yyyy.MM.dd HH0000")
+      $_
+    };
+
+    "Parent+ModifiedDateByDay" = { 
+      $_.GroupingState.tag = (Split-Path $_.FullName -Parent).Split("\")[-1] + " " + $_.LastWriteTime.ToString("yyyy.MM.dd")
+      $_
+    };
   }
 
   $common_task_parameters = @(
@@ -85,28 +156,258 @@ New-Module -ScriptBlock {
     }
   )
 
-  function script:group_items {
+  function script:group_items_backup {
     Param(
       [object[]]$items,
       [scriptblock[]]$grouping_functions,
-      [int]$starting_index = 0
+      [int]$starting_index = 0,
+      [string]$default_group_name = "Orphan"
     )
 
-    #$groups = Group-Object -InputObject $items -Property $grouping_functions[$starting_index] -AsHashTable
     $groups = @{}
 
-    $group_name = "Orphan"
+    $group_name = $default_group_name
 
-    $items | % {
-      $temp_group_name
+    $grouping_state = @{
+      current_index = 0;
+      last_index = $items.Count - 1;
+      default_group_name = $default_group_name;
+      last_group_name = $group_name;
     }
 
+    $items | % {
+
+      Add-Member -InputObject $_ -MemberType NoteProperty -Name GroupingState -Value $grouping_state
+      
+      ## Run the item through the specified grouping function and see if a new tag is returned
+      $temp_group_name = $_ | % $grouping_functions[$starting_index]
+
+      ## If the grouping function returned a non-null value, update the group name.
+      ## If the grouping function returned a null, the last value returned is in force
+      if ($temp_group_name -ne $null) {
+        $group_name = $temp_group_name
+      }
+
+      ## Make sure the group name is associated with an array in the 'groups' hashtable
+      if ($groups.Keys -notcontains $group_name) {
+        $groups[$group_name] = @()
+      }
+
+      ## Decorate the object with a new property indicating how the items has been tagged
+      if ($_.PSObject.Properties.name -notcontains "GroupTag") {
+        
+        ## If the item has not already been decorated, add a new member
+        Add-Member -InputObject $_ -MemberType NoteProperty -Name GroupTags -Value @($group_name)
+      
+      } else {
+        
+        ## If the item has already been grouped, add to the existing list of tags
+        $_.GroupTags += $group_name
+      
+      }
+
+      ## Remove the grouping state decorator as we don't need it any more
+      $_.PSObject.Properties.Remove('GroupingState')
+
+      ## Update the original grouping state reference for the next iterations
+      $grouping_state['current_index'] += 1
+      $grouping_state['last_group_name'] = $group_name
+
+      ## Finally, add our item to the hashtable of groups
+      $groups[$group_name] +=  $_
+    }
+
+    ## If multiple grouping functions are provided, recurse
     if (($starting_index + 1) -lt $grouping_functions.Count) {
-      $groups.Keys | % { $groups[$_] = script:group_items -items $groups[$_] -grouping_functions $grouping_functions -starting_index ($starting_index + 1) }
+      $group_keys = $groups.Keys | %{ "$_" }
+      $group_keys | % { $groups[$_] = script:group_items -items $groups[$_] -grouping_functions $grouping_functions -starting_index ($starting_index + 1) -default_group_name $default_group_name}
     }
 
     return $groups
   }
+
+  function script:group_items {
+    Param(
+      [object[]]$items,
+      [scriptblock[]]$grouping_functions,
+      [int]$starting_index = 0,
+      [string]$default_group_name = "Orphan"
+    )
+
+    $groups = @{}
+    $item_index = 0
+    $last_item_index = $items.Count - 1
+    $is_first_item = $false
+    $is_last_item = $false
+    $last_tag = $default_group_name
+
+    
+    ## Add properties to each item that the grouping functions can rely on
+    <#$items | % {
+      if ( $item_index -eq 0 ) { $is_first_item = $true }
+      if ( $item_index -eq $last_item_index ) { $is_last_item = $true }
+
+      $state = @{
+        items = $items;
+        current_index = $item_index;
+        last_index = $last_item_index;
+        is_first_item = $is_first_item;
+        is_last_item = $is_last_item;
+        default_tag = $default_group_name;
+        last_tag = $default_group_name;
+        tag = $null;
+      }
+
+      if (-not $_.PSObject.Properties["GroupingState"]) {
+        Add-Member -InputObject $_ -MemberType NoteProperty -Name GroupingState -Value $state
+      } else {
+        $_.GroupingState = $state
+      }
+
+      < #if (-not $_.PSObject.Properties.Name["GroupTags"]) {
+        Add-Member -InputObject $_ -MemberType NoteProperty -Name GroupTags -Value @()
+      }# >
+
+      #$_.GroupingState.incoming_tags = $_.GroupingState.GroupTags
+
+      $item_index++
+    }#>
+
+    ## Run each item through the grouping function at $starting_index
+    $items | % {
+      
+      if ( $item_index -eq 0 ) { $is_first_item = $true } else { $is_first_item = $false }
+      if ( $item_index -eq $last_item_index ) { $is_last_item = $true } else { $is_last_item = $false }
+
+      $state = @{
+        items = $items;
+        current_index = $item_index;
+        last_index = $last_item_index;
+        is_first_item = $is_first_item;
+        is_last_item = $is_last_item;
+        default_tag = $default_group_name;
+        last_tag = $last_tag;
+        tag = $null;
+      }
+
+      if (-not $_.PSObject.Properties["GroupingState"]) {
+        Add-Member -InputObject $_ -MemberType NoteProperty -Name GroupingState -Value $state
+      } else {
+        $_.GroupingState = $state
+      }
+
+      $item_index++
+
+      $_
+
+    } | % $grouping_functions[$starting_index] | % {
+      
+      ## Make sure the tag property on the GroupingState is a string or null
+      if (($_.GroupingState.tag -ne $null) -and ($_.GroupingState.tag.GetType() -ne [string])) {
+        throw "The grouping function returned the wrong type. Value must be null or a string"
+      }
+
+      ## If the tag value is null, drop the item. Otherwise...
+      if ($_.GroupingState.tag -ne $null) {
+        
+        ## ...add the item to a hash based on the tag name
+        if (-not $groups.Contains($_.GroupingState.tag)) {
+          $groups[$_.GroupingState.tag] = @()
+        }
+        
+        $groups[$_.GroupingState.tag] += $_
+
+        ## ...set variable for the next iteration
+        $last_tag = $_.GroupingState.tag
+      
+      }
+
+    }
+
+    ## Remove the GroupingState but keep the GroupTags
+    $items | % {
+      $_.PSObject.Properties.Remove("GroupingState")
+    }
+
+    
+    <#% {
+
+      Add-Member -InputObject $_ -MemberType NoteProperty -Name GroupingState -Value $grouping_state
+      
+      ## Run the item through the specified grouping function and see if a new tag is returned
+      $temp_group_name = $_ | % $grouping_functions[$starting_index]
+
+      ## If the grouping function returned a non-null value, update the group name.
+      ## If the grouping function returned a null, the last value returned is in force
+      if ($temp_group_name -ne $null) {
+        $group_name = $temp_group_name
+      }
+
+      ## Make sure the group name is associated with an array in the 'groups' hashtable
+      if ($groups.Keys -notcontains $group_name) {
+        $groups[$group_name] = @()
+      }
+
+      ## Decorate the object with a new property indicating how the items has been tagged
+      if ($_.PSObject.Properties.name -notcontains "GroupTag") {
+        
+        ## If the item has not already been decorated, add a new member
+        Add-Member -InputObject $_ -MemberType NoteProperty -Name GroupTags -Value @($group_name)
+      
+      } else {
+        
+        ## If the item has already been grouped, add to the existing list of tags
+        $_.GroupTags += $group_name
+      
+      }
+
+      ## Remove the grouping state decorator as we don't need it any more
+      $_.PSObject.Properties.Remove('GroupingState')
+
+      ## Update the original grouping state reference for the next iterations
+      $grouping_state['current_index'] += 1
+      $grouping_state['last_group_name'] = $group_name
+
+      ## Finally, add our item to the hashtable of groups
+      $groups[$group_name] +=  $_
+    }s
+    #>
+
+    ## If multiple grouping functions are provided, recurse
+    if (($starting_index + 1) -lt $grouping_functions.Count) {
+      $group_keys = $groups.Keys | %{ "$_" }
+      $group_keys | % { $groups[$_] = script:group_items -items $groups[$_] -grouping_functions $grouping_functions -starting_index ($starting_index + 1) -default_group_name $default_group_name }
+    }
+
+    ## Group items based on tags into nested hash tables
+    <#$group = @{}
+    $items | % {
+      $current_level = $group
+      for ($i = 0; $i -lt $_.GroupTags.Count; $i++) {
+        $tag = $_.GroupTags[$i]
+        if (-not $current_level.Contains($tag)) { 
+          if ($i -eq ($_.GroupTags.Count - 1)) {
+            $current_level[$tag] = @()
+          } else {
+            $current_level[$tag] = @{}
+            $current_level = $current_level[$tag]
+          }
+        } else {
+          $current_level = $current_level[$tag]
+        }
+      }
+
+      try {
+        $current_level += $_
+      } catch {
+        throw "Item groups are nested un-evenly, unable to create hashtable"
+      }
+    }#>
+
+
+    return $groups
+  }
+
 
   function script:item_matches_filters {
     Param(
@@ -181,6 +482,20 @@ New-Module -ScriptBlock {
       return $groups
     }
 
+  }
+
+  function script:get_newest_file {
+    Param (
+      [Parameter(
+        Mandatory = $true,
+        ValueFromPipeline = $false
+      )]
+      [System.IO.FileSystemInfo[]]$file_objects
+    )
+
+    $file_objects = $file_objects | Sort-Object -Property LastWriteTime
+
+    return $file_objects[$file_objects.Count - 1]
   }
 
   <#
@@ -638,24 +953,100 @@ New-Module -ScriptBlock {
     }
 
     Begin {
-      # Create friendly variables for dynamic parameters
+      # Create friendly variable names for dynamic parameters
       $function_parameters | % {
         Set-Variable -Name $_.Name -Value $PsBoundParameters[$_.Name]
       }
     }
 
     Process {
+
+      # Group items starting in the base path first by directory, then by grouping function
       $item_groups = script:get_filtered_groups `
         -base_path $Path `
         -include_filter { $_.FullName -match $Include } `
         -exclude_filter { $_.FullName -match $Exclude } `
-        -grouping_function @({$_.DirectoryName}, $grouping_functions[$ItemGroupingMethod]) `
+        -grouping_function @({$_.GroupingState.tag = $_.DirectoryName; $_}, $grouping_functions[$ItemGroupingMethod]) `
         -recurse:$Recurse
 
-      $item_groups | Out-String | Write-Host
+      # Archive groups within directories
+      $item_groups.Keys | % {
+      
+        # Retain the base path of the item group
+        $group_base_path = $_
+
+        # Pass the groups items down the pipe
+        $item_groups[$group_base_path].Keys | ? { 
+        
+          # If the newest file in the group is within the "UnactionableTimespan", skip the group
+          (script:get_newest_file -file_objects $item_groups[$group_base_path][$_]).LastWriteTime.AddMilliseconds($UnactionableTimespan.TotalMilliseconds) -le (Get-Date)
+
+        } | % {
+
+          # Split the group into one or more archives using the specified naming function
+          # 2do: If I don't allow custom naming function, I don't need the "Invalid" default group name
+          $archive_name_groups = script:group_items -items $item_groups[$group_base_path][$_] -grouping_functions $naming_functions[$ArchiveNamingMethod] -default_group_name "Invalid"
+
+          $archives_created = @()
+          foreach ($archive_name in $archive_name_groups.Keys) {
+
+            $full_archive_name = $group_base_path + "\" + $archive_name + ".7z"
+            $item_name_strings = $archive_name_groups[$archive_name] | % { $_.FullName }
+
+            ## Append or create the archive
+            if ($WhatIf) {
+              Write-Host "`nWhat if: Performing the operation Add-7zArchive on target `"$full_archive_name`" with the following items:"
+              $item_name_strings | %{ Write-Host "`tAdding: $_" }
+            } else {
+              Add-7zArchive -Path $full_archive_name -Include $item_name_strings
+            }
+
+            ## Test the archive to see if it was created successfully
+            if ($WhatIf) {
+              Write-Host "What if: Performing the operation Test-7zArchive on target `"$full_archive_name`" with the option, 'FailIfEmpty'"
+              $archive_ok = $true
+            } else {
+              try {
+                $archive_ok = Test-7zArchive -Path $full_archive_name -FailIfEmpty
+              } catch {
+                $archive_ok = $false
+              }
+            }
+
+            ## If the archive isn't okay, stop processing
+            if (-not $archive_ok) {
+              Write-Error "The archive, $full_archive_name, failed consistency checks."
+              break
+            }
+
+            ## Otherwise, rock on
+            $archives_created += $full_archive_name
+
+          }
+
+          # If the archive group wasn't scompleted...
+          if ($archives_created.Count -lt $archive_name_groups.Keys.Count) {
+
+            # ...delete the archive and log the error
+            Write-Error "One or more archives failed consistency checks. Archives in the current group will be deleted and the group files left in place."
+            $archives_created | Remove-Item -Force -WhatIf:$WhatIf
+
+          } elseif (-not $RetainProcessedItems) {
+
+            # And the delete_original option is set,  the Delete the source files
+            $item_name_strings | Remove-Item -Force -WhatIf:$WhatIf
+
+          }
+
+          return $archives_created
+
+        }
+      
+      }
+
     }
 
-    End { Write-Host $ItemGroupingMethod; Write-Host $ArchiveNamingMethod}
+    End {}
   }
 
   function New-CycleTask {
@@ -710,14 +1101,15 @@ New-Module -ScriptBlock {
 ###   what_if= <$true|$false>; #Run in "WhatIf" mode for testing (see output in log file)
 ### }
 ### =====================================================================================
-New-ArchiveTask -Path "D:\Temp\CnC Tests" `
-                -ItemGroupingMethod SQLFulls `
-                -ArchiveNamingMethod "Parent+Group" `
+$archive_task_results = New-ArchiveTask -Path "D:\Temp\CnC Tests" `
+                -ItemGroupingMethod BySQLFulls `
+                -ArchiveNamingMethod "Parent+ModifiedDateByDay" `
                 -Include '\.(bak|trn|dif)$' `
                 -Exclude '\.(zip|7z)$' `
                 -UnactionableTimeSpan (New-Object System.TimeSpan(1,0,0,0)) `
                 -Recurse `
-                -WhatIF
+                -WhatIF:$true `
+                -RetainProcessedItems
 
 New-CycleTask   -Path "D:\Temp\CnC Tests" `
                 -ItemGroupingMethod None `
